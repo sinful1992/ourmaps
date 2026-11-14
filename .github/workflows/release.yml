@@ -142,7 +142,7 @@ jobs:
         id: apk
         run: |
           apk=$(ls up/android/app/build/outputs/apk/fdroid/release/OurMaps-*-fdroid-release.apk)
-          [ $(printf '%s\n' "$apk" | wc -l) -eq 1 ] || { echo "::error::expected one APK, got: $apk"; exit 1; }
+          [ "$(printf '%s\n' "$apk" | wc -l)" -eq 1 ] || { echo "::error::expected one APK, got: $apk"; exit 1; }
           fork/scripts/check-apk.sh "$apk" "$APP_ID" "$APP_LABEL" "${{ vars.OURMAPS_CERT_SHA256 }}" | tee -a check.txt
           mkdir out && cp "$apk" out/ && (cd out && sha256sum *.apk > "$(basename "$apk").sha256")
           echo "name=$(basename "$apk")" >> "$GITHUB_OUTPUT"

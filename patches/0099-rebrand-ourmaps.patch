@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: linus <linus@team.local>
+Date: Sat, 14 Nov 2026 00:36:24 +0000
+Subject: [PATCH 4/4] [android] Rebrand as OurMaps
+ (io.github.sinful1992.ourmaps), fork build
+
+App name OurMaps, application id io.github.sinful1992.ourmaps with no
+fdroid suffix, so it installs beside CoMaps. The debug key alias is
+pinned to the alias inside comaps-debug.keystore.
+---
+ android/app/build.gradle.kts | 7 +++----
+ 1 file changed, 3 insertions(+), 4 deletions(-)
+
+diff --git a/android/app/build.gradle.kts b/android/app/build.gradle.kts
+index fe01b90ee..7d029edc4 100644
+--- a/android/app/build.gradle.kts
++++ b/android/app/build.gradle.kts
+@@ -38,8 +38,8 @@ java {
+     }
+ }
+ 
+-val appName = "CoMaps"
+-val appId = "app.comaps"
++val appName = "OurMaps"
++val appId = "io.github.sinful1992.ourmaps"
+ // These are properly set in the 'secure.properties.*' files but must be declared here for build sync to succeed.
+ project.ext["secretTestStoreFile"] = "comaps-test.keystore"
+ project.ext["secretTestStorePassword"] = ""
+@@ -125,7 +125,6 @@ android {
+ 
+         create("fdroid") {
+             dimension = "default"
+-            applicationIdSuffix = ".fdroid"
+             versionName = "${android.defaultConfig.versionName!!}-FDroid"
+             buildConfigField("String", "SUPPORT_MAIL", "\"fdroid@comaps.app\"")
+         }
+@@ -200,7 +199,7 @@ android {
+         getByName("debug") {
+             storeFile = project.projectDir.resolve(File(comapsDebugKeystorePath))
+             storePassword = "12345678"
+-            keyAlias = "$appName Debug"
++            keyAlias = "CoMaps Debug" // alias inside comaps-debug.keystore; appName is OurMaps in this fork
+             keyPassword = "12345678"
+         }
+         create("test") {
+-- 
+2.53.0
+

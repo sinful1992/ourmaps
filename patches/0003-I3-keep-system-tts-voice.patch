@@ -1,0 +1,157 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sinful1992 <sinful1992@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 17:23:41 +0000
+Subject: [PATCH 3/4] [android] Keep the system TTS voice for the selected
+ language
+
+TtsPlayer called TextToSpeech.setLanguage() with the bare language from
+the supported list ("en"), and many engines answer a bare language with
+their main country voice. On a phone set to English (UK) the voice
+switched from en-GB to en-US on every start.
+
+Use the engine's default voice when it is installed, works offline and
+speaks the requested language (and country, for entries such as pt-BR
+or es-MX); otherwise, or if setVoice() fails, fall back to setLanguage()
+as before.
+---
+ .../app/organicmaps/sdk/sound/TtsPlayer.java  | 22 +++++++-
+ .../organicmaps/sdk/sound/VoiceSelector.java  | 27 +++++++++
+ .../sdk/sound/VoiceSelectorTest.java          | 55 +++++++++++++++++++
+ 3 files changed, 103 insertions(+), 1 deletion(-)
+ create mode 100644 android/sdk/src/main/java/app/organicmaps/sdk/sound/VoiceSelector.java
+ create mode 100644 android/sdk/src/test/java/app/organicmaps/sdk/sound/VoiceSelectorTest.java
+
+diff --git a/android/sdk/src/main/java/app/organicmaps/sdk/sound/TtsPlayer.java b/android/sdk/src/main/java/app/organicmaps/sdk/sound/TtsPlayer.java
+index 61bc1ffbc..21fc47b51 100644
+--- a/android/sdk/src/main/java/app/organicmaps/sdk/sound/TtsPlayer.java
++++ b/android/sdk/src/main/java/app/organicmaps/sdk/sound/TtsPlayer.java
+@@ -111,11 +111,31 @@ public enum TtsPlayer
+     return null;
+   }
+ 
++  // Keeps the voice the user picked in the system TTS settings (e.g. en-GB) when it speaks the requested
++  // language: setLanguage() with a bare language like "en" makes many engines switch to en-US.
++  private boolean useDefaultVoiceFor(@NonNull Locale locale)
++  {
++    final Voice voice = mTts.getDefaultVoice();
++    if (voice == null)
++      return false;
++    final Set<String> features = voice.getFeatures();
++    final boolean installed =
++        features == null || !features.contains(TextToSpeech.Engine.KEY_FEATURE_NOT_INSTALLED);
++    if (!VoiceSelector.shouldUseDefaultVoice(locale, voice.getLocale(), installed,
++                                             voice.isNetworkConnectionRequired()))
++      return false;
++    if (mTts.setVoice(voice) != TextToSpeech.SUCCESS)
++      return false;
++    Logger.d(TAG, "Using the engine's default voice " + voice.getName() + " for " + locale);
++    return true;
++  }
++
+   private boolean setLanguageInternal(LanguageData lang)
+   {
+     try
+     {
+-      mTts.setLanguage(lang.locale);
++      if (!useDefaultVoiceFor(lang.locale))
++        mTts.setLanguage(lang.locale);
+       nativeSetTurnNotificationsLocale(lang.internalCode);
+       Config.TTS.setLanguage(lang.internalCode);
+ 
+diff --git a/android/sdk/src/main/java/app/organicmaps/sdk/sound/VoiceSelector.java b/android/sdk/src/main/java/app/organicmaps/sdk/sound/VoiceSelector.java
+new file mode 100644
+index 000000000..6b073444f
+--- /dev/null
++++ b/android/sdk/src/main/java/app/organicmaps/sdk/sound/VoiceSelector.java
+@@ -0,0 +1,27 @@
++package app.organicmaps.sdk.sound;
++
++import androidx.annotation.NonNull;
++import androidx.annotation.Nullable;
++import java.util.Locale;
++
++final class VoiceSelector
++{
++  private VoiceSelector() {}
++
++  /**
++   * @return true if the TTS engine's default voice should be kept for {@code requested} instead of calling
++   * TextToSpeech.setLanguage(requested). It is kept when it is installed, works offline (navigation prompts must
++   * not go silent without data), speaks the same language and, if {@code requested} names a country (pt-BR, es-MX,
++   * zh-TW), the same country.
++   */
++  static boolean shouldUseDefaultVoice(@NonNull Locale requested, @Nullable Locale defaultVoiceLocale,
++                                       boolean defaultVoiceInstalled, boolean defaultVoiceNeedsNetwork)
++  {
++    if (defaultVoiceLocale == null || !defaultVoiceInstalled || defaultVoiceNeedsNetwork)
++      return false;
++    if (!requested.getLanguage().equals(defaultVoiceLocale.getLanguage()))
++      return false;
++    final String country = requested.getCountry();
++    return country.isEmpty() || country.equalsIgnoreCase(defaultVoiceLocale.getCountry());
++  }
++}
+diff --git a/android/sdk/src/test/java/app/organicmaps/sdk/sound/VoiceSelectorTest.java b/android/sdk/src/test/java/app/organicmaps/sdk/sound/VoiceSelectorTest.java
+new file mode 100644
+index 000000000..71b9f8941
+--- /dev/null
++++ b/android/sdk/src/test/java/app/organicmaps/sdk/sound/VoiceSelectorTest.java
+@@ -0,0 +1,55 @@
++package app.organicmaps.sdk.sound;
++
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertTrue;
++
++import java.util.Locale;
++import org.junit.Test;
++
++public class VoiceSelectorTest
++{
++  private static final Locale EN = new Locale("en", "");
++
++  @Test
++  public void bareLanguageKeepsUserCountryVoice()
++  {
++    // The bug: "en" + setLanguage() switched an en-GB phone to the en-US voice.
++    assertTrue(VoiceSelector.shouldUseDefaultVoice(EN, Locale.UK, true, false));
++    assertTrue(VoiceSelector.shouldUseDefaultVoice(EN, Locale.US, true, false));
++    assertTrue(VoiceSelector.shouldUseDefaultVoice(new Locale("de", ""), Locale.GERMANY, true, false));
++  }
++
++  @Test
++  public void otherLanguageUsesSetLanguage()
++  {
++    assertFalse(VoiceSelector.shouldUseDefaultVoice(EN, Locale.GERMANY, true, false));
++    assertFalse(VoiceSelector.shouldUseDefaultVoice(new Locale("de", ""), Locale.UK, true, false));
++  }
++
++  @Test
++  public void explicitCountryMustMatch()
++  {
++    final Locale ptBR = new Locale("pt", "BR");
++    assertTrue(VoiceSelector.shouldUseDefaultVoice(ptBR, new Locale("pt", "BR"), true, false));
++    assertTrue(VoiceSelector.shouldUseDefaultVoice(ptBR, new Locale("pt", "br"), true, false));
++    assertFalse(VoiceSelector.shouldUseDefaultVoice(ptBR, new Locale("pt", "PT"), true, false));
++    assertFalse(VoiceSelector.shouldUseDefaultVoice(ptBR, new Locale("pt", ""), true, false));
++    assertFalse(VoiceSelector.shouldUseDefaultVoice(new Locale("es", "ES"), new Locale("es", "MX"), true, false));
++    assertFalse(VoiceSelector.shouldUseDefaultVoice(new Locale("zh", "TW"), new Locale("zh", "CN"), true, false));
++  }
++
++  @Test
++  public void missingOrNotInstalledDefaultVoiceUsesSetLanguage()
++  {
++    assertFalse(VoiceSelector.shouldUseDefaultVoice(EN, null, true, false));
++    assertFalse(VoiceSelector.shouldUseDefaultVoice(EN, Locale.UK, false, false));
++  }
++
++  @Test
++  public void networkOnlyDefaultVoiceUsesSetLanguage()
++  {
++    // CoMaps works offline: a network voice would leave prompts silent without data.
++    assertFalse(VoiceSelector.shouldUseDefaultVoice(EN, Locale.UK, true, true));
++    assertFalse(VoiceSelector.shouldUseDefaultVoice(new Locale("pt", "BR"), new Locale("pt", "BR"), true, true));
++  }
++}
+-- 
+2.53.0
+

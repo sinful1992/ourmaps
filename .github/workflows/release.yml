@@ -1,0 +1,175 @@
+name: Release
+# Build OurMaps: upstream CoMaps at a release tag + patches/, fdroid flavour, signed with the OurMaps key.
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: "Upstream tag to build (empty = the tag in BASE)"
+        required: false
+        default: ""
+      publish:
+        description: "Publish a GitHub Release (off = build + checks only)"
+        type: boolean
+        default: true
+  workflow_call:
+    inputs:
+      upstream_tag:
+        type: string
+        required: false
+        default: ""
+      fork_ref:
+        description: "Fork commit to take patches/ and scripts/ from"
+        type: string
+        required: false
+        default: ""
+      publish:
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ourmaps-release
+  cancel-in-progress: false
+
+env:
+  APP_ID: io.github.sinful1992.ourmaps
+  APP_LABEL: OurMaps
+  UPSTREAM: https://codeberg.org/comaps/comaps.git
+  JAVA_HOME: /usr/lib/jvm/temurin-21-jdk-amd64  # Android Gradle plugin 8 needs Java 21
+  SKIP_MAP_DOWNLOAD: "true"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          path: fork
+          ref: ${{ inputs.fork_ref || github.ref }}
+
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y ninja-build qt6-base-dev qt6-declarative-dev qt6-positioning-dev libqt6svg6-dev \
+            optipng libfreetype-dev libharfbuzz-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev \
+            python3-pip python3-venv zlib1g-dev
+          pip install "protobuf<3.21" --break-system-packages
+
+      - name: Resolve upstream tag
+        id: tag
+        run: |
+          tag="${{ inputs.upstream_tag }}"
+          [ -n "$tag" ] || tag=$(tr -d ' \n' < fork/BASE)
+          if ! printf '%s' "$tag" | grep -Eq '^v[0-9]{4}\.[0-9]{2}\.[0-9]{2}-[0-9]+$'; then
+            echo "::error::'$tag' is not an upstream Android release tag"; exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout upstream ${{ steps.tag.outputs.tag }}
+        run: |
+          git clone --depth 1 --branch "${{ steps.tag.outputs.tag }}" "$UPSTREAM" up
+          cd up && git submodule update --depth 1 --init --recursive --jobs=$(($(nproc) * 20))
+
+      - name: Apply patches
+        run: |
+          set +e
+          fork/scripts/apply.sh up fork/patches apply-report.md; rc=$?
+          set -e
+          { echo "### Patches on ${{ steps.tag.outputs.tag }}"; echo; cat apply-report.md; } >> "$GITHUB_STEP_SUMMARY"
+          cat apply-report.md
+          [ $rc -eq 0 ] || { echo "::error::patches do not apply (see report); run upstream-watch for the issue"; exit 1; }
+
+      - name: Configure
+        working-directory: up
+        run: ./configure.sh
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ourmaps-fdroid-arm64
+          max-size: 2G
+
+      - name: Restore release key
+        env:
+          KEYSTORE_B64: ${{ secrets.OURMAPS_KEYSTORE_B64 }}
+          STORE_PASSWORD: ${{ secrets.OURMAPS_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.OURMAPS_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.OURMAPS_KEY_PASSWORD }}
+          CERT_SHA256: ${{ vars.OURMAPS_CERT_SHA256 }}
+        run: |
+          for v in KEYSTORE_B64 STORE_PASSWORD KEY_ALIAS KEY_PASSWORD CERT_SHA256; do
+            [ -n "${!v}" ] || { echo "::error::$v is not set (repo secrets/variables)"; exit 1; }
+          done
+          umask 077
+          printf '%s' "$KEYSTORE_B64" | base64 -d > up/android/app/ourmaps-release.keystore
+          # Groovy single-quoted strings: escape backslash and quote.
+          q() { local s=${1//\\/\\\\}; s=${s//\'/\\\'}; printf "'%s'" "$s"; }
+          {
+            echo "project.ext['secretReleaseStoreFile'] = 'ourmaps-release.keystore'"
+            echo "project.ext['secretReleaseStorePassword'] = $(q "$STORE_PASSWORD")"
+            echo "project.ext['secretReleaseKeyAlias'] = $(q "$KEY_ALIAS")"
+            echo "project.ext['secretReleaseKeyPassword'] = $(q "$KEY_PASSWORD")"
+          } > up/android/app/secure.properties.release
+
+      - name: Build fdroid release (arm64)
+        working-directory: up/android
+        env:
+          CMAKE_C_COMPILER_LAUNCHER: ccache
+          CMAKE_CXX_COMPILER_LAUNCHER: ccache
+        run: |
+          set -o pipefail
+          ./gradlew -Parm64 assembleFdroidRelease 2>&1 | tee ../../gradle.log
+          if grep -q "NO RELEASE signing keys found" ../../gradle.log || ! grep -q "Using RELEASE signing keys" ../../gradle.log; then
+            echo "::error::gradle did not use the release key"; exit 1
+          fi
+
+      - name: Remove release key
+        if: always()
+        run: rm -f up/android/app/ourmaps-release.keystore up/android/app/secure.properties.release
+
+      - name: Check APK
+        id: apk
+        run: |
+          apk=$(ls up/android/app/build/outputs/apk/fdroid/release/OurMaps-*-fdroid-release.apk)
+          [ $(printf '%s\n' "$apk" | wc -l) -eq 1 ] || { echo "::error::expected one APK, got: $apk"; exit 1; }
+          fork/scripts/check-apk.sh "$apk" "$APP_ID" "$APP_LABEL" "${{ vars.OURMAPS_CERT_SHA256 }}" | tee -a check.txt
+          mkdir out && cp "$apk" out/ && (cd out && sha256sum *.apk > "$(basename "$apk").sha256")
+          echo "name=$(basename "$apk")" >> "$GITHUB_OUTPUT"
+          { echo "### APK checks"; echo; sed 's/^/- /' check.txt; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ourmaps-${{ steps.tag.outputs.tag }}
+          path: out/*
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: ${{ inputs.publish }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        working-directory: fork
+        run: |
+          n=$(gh release list --limit 200 --json tagName -q '.[].tagName' | grep -c "^${TAG}-own[0-9]*$" || true)
+          rel="${TAG}-own$((n + 1))"
+          {
+            echo "OurMaps on CoMaps ${TAG}, fdroid flavour, arm64, signed with the OurMaps key."
+            echo
+            cat ../apply-report.md
+            echo
+            echo "Checks:"; sed 's/^/- /' ../check.txt
+          } > ../notes.md
+          gh release create "$rel" ../out/* --title "OurMaps $rel" --notes-file ../notes.md --target "$(git rev-parse HEAD)"
+          echo "Published $rel" >> "$GITHUB_STEP_SUMMARY"

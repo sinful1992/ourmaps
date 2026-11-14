@@ -1,0 +1,200 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sinful1992 <sinful1992@gmail.com>
+Date: Fri, 13 Nov 2026 18:28:10 +0000
+Subject: [PATCH 1/4] [map] Sort bookmarks and tracks A-Z by letter, ignoring
+ case and accents
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Names were compared as raw UTF-8 bytes, so every lower-case name came
+after "Z" and names starting with an accented letter (É, Š, Ą...) came
+after that. Compare a case-folded key instead, where accents on Latin
+and Greek letters are dropped. Other scripts keep their letters as they
+are, since there a mark can make a separate letter (Cyrillic й, ї, ў).
+The original name is a stable tie-break.
+
+Fixes #5622
+---
+ libs/map/bookmark_manager.cpp         | 69 +++++++++++++++++++++++--
+ libs/map/map_tests/bookmarks_test.cpp | 74 +++++++++++++++++++++++++++
+ 2 files changed, 139 insertions(+), 4 deletions(-)
+
+diff --git a/libs/map/bookmark_manager.cpp b/libs/map/bookmark_manager.cpp
+index 85dbd97c1..f51d42d4e 100644
+--- a/libs/map/bookmark_manager.cpp
++++ b/libs/map/bookmark_manager.cpp
+@@ -1287,11 +1287,72 @@ void BookmarkManager::SortTracksByTime(std::vector<SortTrackData> & tracks)
+             [](SortTrackData const & lbm, SortTrackData const & rbm) { return lbm.m_timestamp > rbm.m_timestamp; });
+ }
+ 
++namespace
++{
++// A-Z order by letter, not by UTF-8 byte: case is ignored, and accents on Latin and Greek letters are ignored
++// ("é" sorts with "e", "Š" with "S", "apple" before "Zoo"). Other scripts keep their letters as they are, because
++// there a mark can make a separate letter (Cyrillic й/ї/ў come after и/і/у). Names that are equal under this key
++// keep a stable order by the original name. https://codeberg.org/comaps/comaps/issues/5622
++strings::UniString GetNameSortKey(std::string const & name)
++{
++  auto const isCombiningMark = [](strings::UniChar c) { return c >= 0x0300 && c <= 0x036F; };
++  auto const isLatinOrGreek = [](strings::UniChar c)
++  { return c < 0x0080 || (c >= 0x00C0 && c <= 0x024F) || (c >= 0x0370 && c <= 0x03FF) || (c >= 0x1E00 && c <= 0x1FFF); };
++
++  strings::UniString const lower = strings::MakeLowerCase(strings::MakeUniString(name));
++  strings::UniString key;
++  key.reserve(lower.size());
++  // Marks are dropped after Latin/Greek letters, including marks that are already separate in the name (NFD text
++  // from some KML/GPX files, or Turkish "İ", which MakeLowerCase turns into "i" + U+0307).
++  bool foldMarks = false;
++  for (strings::UniChar const c : lower)
++  {
++    if (isCombiningMark(c))
++    {
++      if (!foldMarks)
++        key.push_back(c);
++      continue;
++    }
++    foldMarks = isLatinOrGreek(c);
++    if (!foldMarks || c < 0x0080)
++    {
++      key.push_back(c);
++      continue;
++    }
++    strings::UniString decomposed;
++    decomposed.push_back(c);
++    strings::NormalizeInplace(decomposed);  // NFKD: "é" -> "e" + U+0301.
++    for (strings::UniChar const d : decomposed)
++      if (!isCombiningMark(d))
++        key.push_back(d);
++  }
++  return key;
++}
++
++template <typename T>
++void SortByNameKey(std::vector<T> & items, std::string const & (*getName)(T const &))
++{
++  std::vector<std::pair<strings::UniString, T>> keyed;
++  keyed.reserve(items.size());
++  for (auto & item : items)
++    keyed.emplace_back(GetNameSortKey(getName(item)), std::move(item));
++
++  std::sort(keyed.begin(), keyed.end(), [getName](auto const & l, auto const & r)
++  {
++    if (l.first != r.first)
++      return l.first < r.first;
++    return getName(l.second) < getName(r.second);
++  });
++
++  for (size_t i = 0; i < keyed.size(); ++i)
++    items[i] = std::move(keyed[i].second);
++}
++}  // namespace
++
+ // static
+ void BookmarkManager::SortTracksByName(std::vector<SortTrackData> & tracks)
+ {
+-  std::sort(tracks.begin(), tracks.end(),
+-            [](SortTrackData const & lbm, SortTrackData const & rbm) { return lbm.m_name < rbm.m_name; });
++  SortByNameKey<SortTrackData>(tracks, [](SortTrackData const & t) -> std::string const & { return t.m_name; });
+ }
+ 
+ void BookmarkManager::SortByDistance(std::vector<SortBookmarkData> const & bookmarksForSort,
+@@ -1486,8 +1547,8 @@ void BookmarkManager::SortByName(std::vector<SortBookmarkData> const & bookmarks
+   for (auto const & mark : bookmarksForSort)
+     sortedMarks.push_back(&mark);
+ 
+-  std::sort(sortedMarks.begin(), sortedMarks.end(),
+-            [](SortBookmarkData const * lbm, SortBookmarkData const * rbm) { return lbm->m_name < rbm->m_name; });
++  SortByNameKey<SortBookmarkData const *>(sortedMarks, [](SortBookmarkData const * const & m) -> std::string const &
++  { return m->m_name; });
+ 
+   // Put all bookmarks into one block
+   SortedBlock bookmarkBlock;
+diff --git a/libs/map/map_tests/bookmarks_test.cpp b/libs/map/map_tests/bookmarks_test.cpp
+index d61867957..ea9e0136e 100644
+--- a/libs/map/map_tests/bookmarks_test.cpp
++++ b/libs/map/map_tests/bookmarks_test.cpp
+@@ -974,6 +974,80 @@ char const * kmlString2 =
+     "</kml>";
+ }
+ 
++// https://codeberg.org/comaps/comaps/issues/5622: A-Z sort ignores case and accents.
++UNIT_TEST(Bookmarks_SortByName_CaseAndAccents)
++{
++  // Sorting needs the region address getter, which the Framework sets up (same as Bookmarks_Sorting).
++  Framework fm(kFrameworkParams);
++  fm.DeregisterAllMaps();
++  BookmarkManager & bmManager = fm.GetBookmarkManager();
++  bmManager.EnableTestMode(true);
++
++  // Puts |names| as bookmarks and as tracks into a new category, sorts it by name, checks both orders.
++  auto const check = [&bmManager](std::vector<std::string> const & names, std::vector<std::string> const & expected)
++  {
++    auto const catId = bmManager.CreateBookmarkCategory("sort", false /* autoSave */);
++    std::map<kml::MarkId, std::string> idToName;
++    std::map<kml::TrackId, std::string> trackIdToName;
++    {
++      auto es = bmManager.GetEditSession();
++      for (auto const & name : names)
++      {
++        kml::BookmarkData bm;
++        bm.m_point = m2::PointD(0, 0);
++        bm.m_customName = kml::LocalizableString{{kml::kDefaultLangCode, name}};
++        idToName[es.CreateBookmark(std::move(bm), catId)->GetId()] = name;
++
++        kml::TrackData track;
++        track.m_name = kml::LocalizableString{{kml::kDefaultLangCode, name}};
++        track.m_geometry.AddLine({{{0.0, 0.0}, 1}, {{1.0, 0.0}, 2}});
++        track.m_geometry.AddTimestamps({});
++        auto const * t = es.CreateTrack(std::move(track));
++        es.AttachTrack(t->GetId(), catId);
++        trackIdToName[t->GetId()] = name;
++      }
++    }
++
++    BookmarkManager::SortedBlocksCollection blocks;
++    BookmarkManager::SortParams params;
++    params.m_groupId = catId;
++    params.m_sortingType = BookmarkManager::SortingType::ByName;
++    params.m_onResults = [&blocks](BookmarkManager::SortedBlocksCollection && results,
++                                   BookmarkManager::SortParams::Status) { blocks = std::move(results); };
++    bmManager.GetSortedCategory(params);
++
++    std::vector<std::string> sortedMarks, sortedTracks;
++    for (auto const & block : blocks)
++    {
++      for (auto const id : block.m_markIds)
++        sortedMarks.push_back(idToName.at(id));
++      for (auto const id : block.m_trackIds)
++        sortedTracks.push_back(trackIdToName.at(id));
++    }
++    TEST_EQUAL(sortedMarks, expected, ());
++    TEST_EQUAL(sortedTracks, expected, ());
++  };
++
++  // Latin. Raw UTF-8 byte order would give: Birštonas, Siena, Zoo, apple, eagle, Élysée, Ąžuolynas, Šiauliai.
++  // "siauliai" < "siena" once the caron is ignored; equal keys ("ÉLYSÉE"/"Élysée") fall back to byte order.
++  check({"Zoo", "apple", "Élysée", "eagle", "Šiauliai", "Siena", "Ąžuolynas", "Birštonas", "ÉLYSÉE", "Ąžuolynas"},
++        {"apple", "Ąžuolynas", "Ąžuolynas", "Birštonas", "eagle", "ÉLYSÉE", "Élysée", "Šiauliai", "Siena", "Zoo"});
++
++  // Cyrillic: й, ї are separate letters after и, і and keep that order; case is still ignored.
++  check({"Йошкар", "Иван", "ирина"}, {"Иван", "ирина", "Йошкар"});
++  check({"їжак", "інший", "Іграшка"}, {"Іграшка", "інший", "їжак"});
++
++  // Marks that are already separate are folded too: Turkish "İ" (lower-cased to "i" + U+0307) and NFD "e" + U+0301.
++  check({"Izmir", "İstanbul", "Ankara"}, {"Ankara", "İstanbul", "Izmir"});
++  check({"ezra", "e\u0301toile", "eclair"}, {"eclair", "e\u0301toile", "ezra"});
++
++  // Greek accents are ignored too.
++  check({"Ωμέγα", "άλφα", "Βήτα"}, {"άλφα", "Βήτα", "Ωμέγα"});
++
++  // CoMaps' lower-casing already folds Ł to l; Ø has no decomposition and stays after z; empty names sort first.
++  check({"Łódź", "Zakopane", "Øresund", "", "Lublin"}, {"", "Łódź", "Lublin", "Zakopane", "Øresund"});
++}
++
+ UNIT_CLASS_TEST(Runner, Bookmarks_InnerFolder)
+ {
+   BookmarkManager bmManager(BM_CALLBACKS);
+-- 
+2.53.0
+

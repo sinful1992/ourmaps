@@ -1,0 +1,144 @@
+name: Upstream watch
+# Daily: if CoMaps has a newer Android release than BASE, re-apply patches/ on it and build a release.
+# Patch already in upstream -> dropped (commit + issue). Patch that no longer applies -> issue, no build.
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Only report what would happen (no commit, no build)"
+        type: boolean
+        default: true
+      tag:
+        description: "Try this upstream tag even if it is not newer than BASE (tests)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+  issues: write
+  actions: read
+
+concurrency:
+  group: ourmaps-watch
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: https://codeberg.org/comaps/comaps.git
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      build: ${{ steps.result.outputs.build }}
+      tag: ${{ steps.find.outputs.tag }}
+      sha: ${{ steps.result.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: fork
+
+      - name: Find newest upstream release
+        id: find
+        run: |
+          base=$(tr -d ' \n' < fork/BASE)
+          tag="${{ inputs.tag }}"
+          if [ -z "$tag" ]; then
+            tag=$(fork/scripts/latest-tag.sh "$UPSTREAM")
+            [ -n "$tag" ] || { echo "::error::no upstream Android release tag found"; exit 1; }
+            newest=$(printf '%s\n%s\n' "$base" "$tag" | sort -V | tail -1)
+            if [ "$tag" = "$base" ] || [ "$newest" = "$base" ]; then
+              echo "BASE $base is the newest upstream release ($tag): nothing to do." | tee -a "$GITHUB_STEP_SUMMARY"
+              echo "todo=false" >> "$GITHUB_OUTPUT"; exit 0
+            fi
+          fi
+          echo "BASE $base, trying $tag" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"; echo "base=$base" >> "$GITHUB_OUTPUT"; echo "todo=true" >> "$GITHUB_OUTPUT"
+
+      - name: Try the patches
+        id: apply
+        if: steps.find.outputs.todo == 'true'
+        run: |
+          git clone --depth 1 --branch "${{ steps.find.outputs.tag }}" "$UPSTREAM" up
+          set +e
+          fork/scripts/apply.sh up fork/patches report.md; rc=$?
+          set -e
+          cat report.md; { echo; cat report.md; } >> "$GITHUB_STEP_SUMMARY"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          [ $rc -eq 0 ] || [ $rc -eq 2 ] || exit 1
+
+      - name: Open conflict issue
+        if: steps.apply.outputs.rc == '2'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.find.outputs.tag }}
+          DRY: ${{ inputs.dry_run }}
+        working-directory: fork
+        run: |
+          title="Rebase conflict on upstream $TAG"
+          {
+            echo "A patch no longer applies on CoMaps \`$TAG\`. Nothing was built and BASE stays \`${{ steps.find.outputs.base }}\`."
+            echo
+            cat ../report.md
+            echo
+            echo "Hand fix:"
+            echo "1. Clone upstream at \`$TAG\`, \`git am\` the patches in order, resolve the failing one, \`git format-patch\` it back into \`patches/\` under the same file name."
+            echo "2. If upstream merged this fix in a reworded form (forward and reverse both fail), delete the patch instead."
+            echo "3. Push to main, then run *Upstream watch* again (dry_run off)."
+          } > ../issue.md
+          if [ "$DRY" = "true" ] && [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            title="[dry run] $title"
+          fi
+          gh label create rebase-conflict --color B60205 --description "A patch does not apply on a new upstream release" 2>/dev/null || true
+          if [ -n "$(gh issue list --state open --label rebase-conflict --search "\"$title\" in:title" --json number -q '.[].number')" ]; then
+            echo "Issue already open: $title"
+          else
+            gh issue create --title "$title" --label rebase-conflict --body-file ../issue.md
+          fi
+          exit 1
+
+      - name: Update BASE, drop merged patches
+        id: result
+        if: steps.apply.outputs.rc == '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.find.outputs.tag }}
+          DRY: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+        working-directory: fork
+        run: |
+          merged=$(sed -n 's/^MERGED   //p' ../report.md)
+          if [ "$DRY" = "true" ]; then
+            echo "Dry run: would set BASE to $TAG, drop: ${merged:-none}, then build." | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "build=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          git config user.name "ourmaps-ci"; git config user.email "ourmaps-ci@users.noreply.github.com"
+          for p in $merged; do git rm -q "patches/$p"; done
+          echo "$TAG" > BASE
+          today=$(date -u +%F)
+          entry="## $TAG ($today)"$'\n\n'"- BASE ${{ steps.find.outputs.base }} -> $TAG (upstream watch)."
+          [ -z "$merged" ] || entry+=$'\n'"- Dropped (merged upstream): $(echo $merged | sed 's/ /, /g')."
+          printf '%s\n\n' "$entry" > ../entry.md
+          awk -v f=../entry.md 'NR==1{print; print ""; while((getline l < f)>0) print l; next} {print}' CHANGELOG.md > ../cl.md && mv ../cl.md CHANGELOG.md
+          git add -A BASE CHANGELOG.md patches
+          git commit -qm "Upstream $TAG: BASE bump${merged:+, drop merged patches}"
+          git push origin HEAD:main
+          if [ -n "$merged" ]; then
+            gh label create upstream-merged --color 0E8A16 --description "A fix of ours is now in CoMaps" 2>/dev/null || true
+            gh issue create --title "Upstream $TAG merged: $(echo $merged | sed 's/ /, /g')" --label upstream-merged \
+              --body "CoMaps \`$TAG\` already contains these patches, so they were removed from \`patches/\`: $merged"
+          fi
+          echo "build=true" >> "$GITHUB_OUTPUT"; echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: watch
+    if: needs.watch.outputs.build == 'true'
+    uses: ./.github/workflows/release.yml
+    with:
+      upstream_tag: ${{ needs.watch.outputs.tag }}
+      fork_ref: ${{ needs.watch.outputs.sha }}
+      publish: true
+    secrets: inherit
+    permissions:
+      contents: write

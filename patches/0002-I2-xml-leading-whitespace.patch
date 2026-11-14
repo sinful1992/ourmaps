@@ -1,0 +1,232 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sinful1992 <sinful1992@gmail.com>
+Date: Fri, 13 Nov 2026 16:49:24 +0000
+Subject: [PATCH 2/4] [kml] Import KML/GPX files that start with a blank line
+
+expat only accepts the XML declaration as the very first bytes, so files
+saved from web pages with a leading newline (or a BOM followed by one)
+failed with "Could not parse GPX/KML". Skip a UTF-8 BOM and leading
+whitespace before handing the file to the parser.
+
+Fixes #3963
+---
+ libs/kml/kml_tests/gpx_tests.cpp    | 52 +++++++++++++++++++++++++++++
+ libs/kml/kml_tests/serdes_tests.cpp | 24 +++++++++++++
+ libs/kml/serdes.hpp                 |  2 ++
+ libs/kml/serdes_common.cpp          | 30 +++++++++++++++++
+ libs/kml/serdes_common.hpp          |  6 ++++
+ libs/kml/serdes_gpx.hpp             |  2 ++
+ 6 files changed, 116 insertions(+)
+
+diff --git a/libs/kml/kml_tests/gpx_tests.cpp b/libs/kml/kml_tests/gpx_tests.cpp
+index e89cb171b..7e3cc737c 100644
+--- a/libs/kml/kml_tests/gpx_tests.cpp
++++ b/libs/kml/kml_tests/gpx_tests.cpp
+@@ -404,6 +404,58 @@ UNIT_TEST(OpentracksColor)
+   TEST_EQUAL(expected, dataFromFile.m_tracksData[0].m_layers[0].m_color.m_rgba, ());
+ }
+ 
++UNIT_TEST(Gpx_LeadingWhitespace_Test)
++{
++  // https://codeberg.org/comaps/comaps/issues/3963: files saved from web pages often start with a blank line.
++  std::string_view constexpr gpx = R"(<?xml version="1.0" encoding="UTF-8"?>
++<gpx version="1.1" creator="test" xmlns="http://www.topografix.com/GPX/1/1">
++ <wpt lat="54.68" lon="25.28"><name>Vilnius</name></wpt>
++ <trk><name>Track</name><trkseg><trkpt lat="54.0" lon="25.0"/><trkpt lat="54.1" lon="25.1"/></trkseg></trk>
++</gpx>)";
++  kml::FileData const expected = LoadGpxFromString(gpx);
++  TEST_EQUAL(expected.m_bookmarksData.size(), 1, ());
++  TEST_EQUAL(expected.m_tracksData.size(), 1, ());
++
++  for (std::string_view prefix : {"\n", "\r\n", "  \t\n  ", "\xEF\xBB\xBF", "\xEF\xBB\xBF\n", "\n\xEF\xBB\xBF", "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n"
++                                  "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n"})
++  {
++    std::string const content = std::string(prefix) + std::string(gpx);
++    TEST_EQUAL(LoadGpxFromString(content), expected, (prefix.size()));
++  }
++
++  // Files with no XML at all: no crash, and nothing is imported (empty data or an exception, as before).
++  for (std::string_view bad : {"", "\n  \n", "\xEF\xBB\xBF", "\xEF\xBB\xBF \n"})
++  {
++    kml::FileData data;
++    try
++    {
++      kml::DeserializerGpx(data).Deserialize(MemReader(bad));
++    }
++    catch (kml::DeserializerGpx::DeserializeException const &)
++    {
++    }
++    TEST(data.m_bookmarksData.empty() && data.m_tracksData.empty(), (bad.size()));
++  }
++}
++
++UNIT_TEST(Gpx_LeadingWhitespaceSize_Test)
++{
++  auto const size = [](std::string_view s) { return kml::GetXmlLeadingWhitespaceSize(MemReader(s)); };
++  TEST_EQUAL(size(""), 0, ());
++  TEST_EQUAL(size("<?xml"), 0, ());
++  TEST_EQUAL(size("\n<"), 1, ());
++  TEST_EQUAL(size(" \t\r\n<"), 4, ());
++  TEST_EQUAL(size("\xEF\xBB\xBF<"), 3, ());
++  TEST_EQUAL(size("\xEF\xBB\xBF\r\n<"), 5, ());
++  TEST_EQUAL(size("\xEF\xBB"), 0, ());  // Truncated BOM is not skipped.
++  TEST_EQUAL(size("\n\xEF\xBB\xBF<"), 1, ());  // Whitespace before a BOM: expat then accepts the BOM.
++  TEST_EQUAL(size("x <"), 0, ());          // Only leading bytes count.
++  TEST_EQUAL(size("   "), 3, ());          // All whitespace: everything is skipped, the parser then fails.
++  std::string big(1000, ' ');
++  big += "<";
++  TEST_EQUAL(size(big), 1000, ());  // More than one read chunk.
++}
++
+ UNIT_TEST(ParseFromString)
+ {
+   // String hex sequence #AARRGGBB, uint32 sequence RGBA
+diff --git a/libs/kml/kml_tests/serdes_tests.cpp b/libs/kml/kml_tests/serdes_tests.cpp
+index 1e42dfe7a..98920bcbe 100644
+--- a/libs/kml/kml_tests/serdes_tests.cpp
++++ b/libs/kml/kml_tests/serdes_tests.cpp
+@@ -225,6 +225,30 @@ UNIT_TEST(Kml_Deserialization_Text_Bin_Memory)
+   TEST_EQUAL(dataFromText, dataFromBin, ());
+ }
+ 
++// https://codeberg.org/comaps/comaps/issues/3963: KML with a blank line or BOM before "<?xml".
++UNIT_TEST(Kml_Deserialization_LeadingWhitespace)
++{
++  kml::FileData expected;
++  {
++    kml::DeserializerKml des(expected);
++    des.Deserialize(MemReader(kTextKml, strlen(kTextKml)));
++  }
++  TEST(!expected.m_bookmarksData.empty(), ());
++
++  for (std::string_view prefix : {"\n", "\r\n  ", "\xEF\xBB\xBF", "\xEF\xBB\xBF\n\t"})
++  {
++    std::string const text = std::string(prefix) + kTextKml;
++    kml::FileData data;
++    TEST_NO_THROW(
++        {
++          kml::DeserializerKml des(data);
++          des.Deserialize(MemReader(text.data(), text.size()));
++        },
++        (prefix.size()));
++    TEST_EQUAL(data, expected, (prefix.size()));
++  }
++}
++
+ // 2. Check text serialization to the memory blob and compare with prepared data.
+ UNIT_TEST(Kml_Serialization_Text_Memory)
+ {
+diff --git a/libs/kml/serdes.hpp b/libs/kml/serdes.hpp
+index 4f3d818ef..24a05bafe 100644
+--- a/libs/kml/serdes.hpp
++++ b/libs/kml/serdes.hpp
+@@ -1,5 +1,6 @@
+ #pragma once
+ 
++#include "kml/serdes_common.hpp"
+ #include "kml/type_utils.hpp"
+ #include "kml/types.hpp"
+ 
+@@ -144,6 +145,7 @@ public:
+   void Deserialize(ReaderType const & reader)
+   {
+     NonOwningReaderSource src(reader);
++    src.Skip(GetXmlLeadingWhitespaceSize(reader));
+     KmlParser parser(m_fileData);
+     if (!ParseXML(src, parser, true))
+     {
+diff --git a/libs/kml/serdes_common.cpp b/libs/kml/serdes_common.cpp
+index 347d9551a..cd233da6d 100644
+--- a/libs/kml/serdes_common.cpp
++++ b/libs/kml/serdes_common.cpp
+@@ -1,5 +1,6 @@
+ #include "kml/serdes_common.hpp"
+ 
++#include "coding/reader.hpp"
+ #include "coding/writer.hpp"
+ 
+ #include "geometry/mercator.hpp"
+@@ -7,11 +8,40 @@
+ 
+ #include "base/string_utils.hpp"
+ 
++#include <algorithm>
+ #include <sstream>
+ 
+ namespace kml
+ {
+ 
++uint64_t GetXmlLeadingWhitespaceSize(Reader const & reader)
++{
++  uint64_t const size = reader.Size();
++  uint64_t pos = 0;
++  if (size >= 3)
++  {
++    unsigned char bom[3];
++    reader.Read(0, bom, 3);
++    if (bom[0] == 0xEF && bom[1] == 0xBB && bom[2] == 0xBF)
++      pos = 3;
++  }
++
++  char buf[64];
++  while (pos < size)
++  {
++    size_t const n = static_cast<size_t>(std::min<uint64_t>(sizeof(buf), size - pos));
++    reader.Read(pos, buf, n);
++    for (size_t i = 0; i < n; ++i)
++    {
++      char const c = buf[i];
++      if (c != ' ' && c != '\t' && c != '\r' && c != '\n')
++        return pos + i;
++    }
++    pos += n;
++  }
++  return pos;
++}
++
+ std::string PointToString(m2::PointD const & org, char const separator)
+ {
+   double const lon = mercator::XToLon(org.x);
+diff --git a/libs/kml/serdes_common.hpp b/libs/kml/serdes_common.hpp
+index 9a0a9f415..7939b5858 100644
+--- a/libs/kml/serdes_common.hpp
++++ b/libs/kml/serdes_common.hpp
+@@ -5,10 +5,16 @@
+ 
+ #include "i18n/localisation.hpp"
+ 
++class Reader;
+ class Writer;
+ 
+ namespace kml
+ {
++// Returns how many bytes at the start of |reader| are a UTF-8 BOM and/or whitespace in front of the XML.
++// expat only accepts "<?xml ...?>" as the very first bytes, so a KML/GPX file that starts with a blank line
++// (common for files saved from web pages) could not be imported. The deserializers skip these bytes.
++uint64_t GetXmlLeadingWhitespaceSize(Reader const & reader);
++
+ auto constexpr kDefaultLang = localisation::kDefaultNameIndex;
+ auto constexpr kDefaultTrackWidth = 5.0;
+ auto constexpr kDefaultTrackColor = 0x006ec7ff;
+diff --git a/libs/kml/serdes_gpx.hpp b/libs/kml/serdes_gpx.hpp
+index 25834a396..d96bd57fb 100644
+--- a/libs/kml/serdes_gpx.hpp
++++ b/libs/kml/serdes_gpx.hpp
+@@ -1,5 +1,6 @@
+ #pragma once
+ 
++#include "kml/serdes_common.hpp"
+ #include "kml/types.hpp"
+ 
+ #include "coding/parse_xml.hpp"
+@@ -121,6 +122,7 @@ public:
+   void Deserialize(ReaderType const & reader)
+   {
+     NonOwningReaderSource src(reader);
++    src.Skip(GetXmlLeadingWhitespaceSize(reader));
+ 
+     gpx::GpxParser parser(m_fileData);
+     if (!ParseXML(src, parser, true))
+-- 
+2.53.0
+

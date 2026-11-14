@@ -3,6 +3,10 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+defaults:
+  run:
+    shell: bash  # bash -eo pipefail: a failing check piped into tee fails the step
+
 permissions:
   contents: read
 jobs:
@@ -15,3 +19,5 @@ jobs:
         run: tests/test-scripts.sh
       - name: check-apk.sh
         run: tests/test-check-apk.sh
+      - name: check-deps.sh
+        run: tests/test-check-deps.sh

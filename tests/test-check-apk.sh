@@ -31,6 +31,7 @@ mkzip() { (cd "$tmp" && rm -rf z && mkdir z && cd z && for f in "$@"; do printf 
 APKNAME=ok.apk;   mkzip "classes.dex=Lapp/organicmaps/Foo;Landroidx/core/Bar;" "classes2.dex=Lokhttp3/Call;" "AndroidManifest.xml=x"
 APKNAME=gms.apk;  mkzip "classes.dex=Lapp/x;" "classes2.dex=Lcom/google/android/gms/location/FusedLocationProviderClient;"
 APKNAME=fb.apk;   mkzip "classes.dex=Lcom/google/firebase/FirebaseApp;"
+APKNAME=pc.apk;   mkzip "classes.dex=Lapp/x;" "classes2.dex=Lcom/google/android/play/core/review/ReviewManager;"
 APKNAME=nodex.apk; mkzip "AndroidManifest.xml=x"
 
 SHA_IN=$KT  t "good apk, keytool-style fingerprint passes" 0
@@ -43,7 +44,8 @@ SHA_IN=$KT  t "id with .fdroid suffix fails" 1 B_ID=io.github.sinful1992.ourmaps
 SHA_IN=$KT  t "upstream id fails" 1 B_ID=app.comaps.fdroid
 SHA_IN=$KT  t "label 'OurMaps Debug' fails" 1 B_LABEL="OurMaps Debug"
 SHA_IN=$KT  t "label CoMaps fails" 1 B_LABEL=CoMaps
-SHA_IN=$KT  APK=$tmp/gms.apk   t "Play services class in classes2.dex fails" 1
+SHA_IN=$KT  APK=$tmp/gms.apk   t "com.google.android.gms class (microG keeps the names) passes" 0
+SHA_IN=$KT  APK=$tmp/pc.apk    t "Play Core class fails" 1
 SHA_IN=$KT  APK=$tmp/fb.apk    t "Firebase class fails" 1
 SHA_IN=$KT  APK=$tmp/nodex.apk t "apk without dex fails" 1
 SHA_IN=$KT  APK=$tmp/missing.apk t "missing apk file fails" 1

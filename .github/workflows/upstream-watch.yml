@@ -15,6 +15,10 @@ on:
         required: false
         default: ""
 
+defaults:
+  run:
+    shell: bash  # bash -eo pipefail: a failing check piped into tee fails the step
+
 permissions:
   contents: write
   issues: write

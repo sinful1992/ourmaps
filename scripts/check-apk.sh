@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Refuse an APK that is not ours: wrong signer, wrong id/name, or Google services inside.
+# Refuse an APK that is not ours: wrong signer, wrong id/name, or Firebase / Play Core inside.
 # Usage: scripts/check-apk.sh <apk> <app-id> <app-label> <cert-sha256>
 #   cert-sha256 in any case, with or without ':' (keytool and apksigner print it differently).
 # Tools: $APKSIGNER and $AAPT2, else the newest $ANDROID_HOME/build-tools.
@@ -39,9 +39,10 @@ dex=$(unzip -Z1 "$apk" | grep -E '^classes[0-9]*\.dex$' || true)
 [ -n "$dex" ] || say "FAIL no classes*.dex in apk"
 g=0
 for d in $dex; do
-  c=$(unzip -p "$apk" "$d" | LC_ALL=C grep -a -c -E 'Lcom/google/android/gms/|Lcom/google/firebase/' || true)
+  c=$(unzip -p "$apk" "$d" | LC_ALL=C grep -a -c -E 'Lcom/google/firebase/|Lcom/google/android/datatransport/|Lcom/google/android/play/core/' || true)
   g=$((g+c))
 done
-[ "$g" -eq 0 ] && say "OK   no Google Play services / Firebase classes" || say "FAIL $g dex hits for com.google.android.gms / firebase"
+# com.google.android.gms classes are allowed here: microG keeps those names. scripts/check-deps.sh checks the artifacts.
+[ "$g" -eq 0 ] && say "OK   no Firebase / Play Core classes" || say "FAIL $g dex hits for Firebase / Play Core"
 
 [ $fails -eq 0 ]

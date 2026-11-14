@@ -27,6 +27,10 @@ on:
         required: false
         default: true
 
+defaults:
+  run:
+    shell: bash  # bash -eo pipefail: a failing check piped into tee fails the step
+
 permissions:
   contents: write
 
@@ -133,6 +137,12 @@ jobs:
           if grep -q "NO RELEASE signing keys found" ../../gradle.log || ! grep -q "Using RELEASE signing keys" ../../gradle.log; then
             echo "::error::gradle did not use the release key"; exit 1
           fi
+
+      - name: Check dependencies (no proprietary Google libraries)
+        working-directory: up/android
+        run: |
+          ./gradlew -q :app:dependencies --configuration fdroidReleaseRuntimeClasspath > ../../deps.txt
+          ../../fork/scripts/check-deps.sh ../../deps.txt | tee ../../check.txt
 
       - name: Remove release key
         if: always()

@@ -1,0 +1,17 @@
+name: Tests
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  scripts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - name: apply.sh + latest-tag.sh
+        run: tests/test-scripts.sh
+      - name: check-apk.sh
+        run: tests/test-check-apk.sh

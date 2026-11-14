@@ -10,6 +10,7 @@ set -euo pipefail
 
 up=${1:?upstream dir}; pdir=${2:?patches dir}; report=${3:?report file}
 pdir=$(cd "$pdir" && pwd)
+case $report in /*) ;; *) report="$PWD/$report" ;; esac
 : > "$report"
 shopt -s nullglob
 patches=("$pdir"/*.patch)

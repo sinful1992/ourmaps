@@ -13,7 +13,7 @@ This repo is a **patch queue**, not a copy of the CoMaps source:
 - `.github/workflows/release.yml` — builds the fdroid flavour (no Google services), arm64, signs it with the OurMaps key and publishes a Release `<BASE>-own<N>`.
 - `.github/workflows/upstream-watch.yml` — daily 05:17 UTC: on a newer CoMaps release, re-applies the patches on a `watch/<tag>` branch and builds from it; `main` (BASE) moves only after a green build. Merged patches are dropped; a conflict opens a `rebase-conflict` issue, a failed build a `build-failed` issue (BASE unchanged, so the next day retries). After 45 days with no commit on main it pushes a `KEEPALIVE` date file, so GitHub's 60-day idle switch-off never triggers (GitHub also emails the owner before disabling; re-enable under Actions if it ever happens).
 
-Tests: `tests/test-scripts.sh`, `tests/test-check-apk.sh`.
+Tests: `tests/test-scripts.sh`, `tests/test-check-apk.sh` (run on every push by `tests.yml`).
 
 Signing: secrets `OURMAPS_KEYSTORE_B64`, `OURMAPS_STORE_PASSWORD`, `OURMAPS_KEY_ALIAS`, `OURMAPS_KEY_PASSWORD`; variable `OURMAPS_CERT_SHA256` (the public cert fingerprint the APK must carry).
 

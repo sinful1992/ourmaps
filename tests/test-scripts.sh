@@ -81,5 +81,12 @@ check "latest-tag numeric sort -100 > -16 (got $got)" "[ '$got' = v2026.11.07-10
 got=$(printf 'zzz	refs/tags/nightly\n' | "$here/scripts/latest-tag.sh" - || true)
 check "latest-tag empty when none match" "[ -z '$got' ]"
 
+
+# 8. relative paths (as the workflows call it): report lands in the caller's directory
+mk_upstream
+( cd "$tmp" && "$here/scripts/apply.sh" up p rel-report.md ); rc=$?
+check "relative paths exit 0" "[ $rc -eq 0 ]"
+check "relative report written in caller dir" "[ \$(grep -c '^APPLIED' $tmp/rel-report.md 2>/dev/null) -eq 2 ]"
+check "no report left inside the upstream dir" "[ ! -e $tmp/up/rel-report.md ]"
 echo "passed $pass, failed $fail"
 [ $fail -eq 0 ]

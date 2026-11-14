@@ -18,7 +18,7 @@ on:
 permissions:
   contents: write
   issues: write
-  actions: read
+  actions: write
 
 concurrency:
   group: ourmaps-watch
@@ -35,6 +35,7 @@ jobs:
       build: ${{ steps.result.outputs.build }}
       tag: ${{ steps.find.outputs.tag }}
       sha: ${{ steps.result.outputs.sha }}
+      merged: ${{ steps.result.outputs.merged }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -99,16 +100,15 @@ jobs:
           fi
           exit 1
 
-      - name: Update BASE, drop merged patches
+      - name: Prepare BASE bump on a branch (main moves only after a green build)
         id: result
         if: steps.apply.outputs.rc == '0'
         env:
-          GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.find.outputs.tag }}
           DRY: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
         working-directory: fork
         run: |
-          merged=$(sed -n 's/^MERGED   //p' ../report.md)
+          merged=$(sed -n 's/^MERGED   //p' ../report.md | tr '\n' ' ' | sed 's/ *$//')
           if [ "$DRY" = "true" ]; then
             echo "Dry run: would set BASE to $TAG, drop: ${merged:-none}, then build." | tee -a "$GITHUB_STEP_SUMMARY"
             echo "build=false" >> "$GITHUB_OUTPUT"; exit 0
@@ -116,20 +116,26 @@ jobs:
           git config user.name "ourmaps-ci"; git config user.email "ourmaps-ci@users.noreply.github.com"
           for p in $merged; do git rm -q "patches/$p"; done
           echo "$TAG" > BASE
-          today=$(date -u +%F)
-          entry="## $TAG ($today)"$'\n\n'"- BASE ${{ steps.find.outputs.base }} -> $TAG (upstream watch)."
-          [ -z "$merged" ] || entry+=$'\n'"- Dropped (merged upstream): $(echo $merged | sed 's/ /, /g')."
-          printf '%s\n\n' "$entry" > ../entry.md
+          {
+            echo "## $TAG ($(date -u +%F))"; echo
+            echo "- BASE ${{ steps.find.outputs.base }} -> $TAG (upstream watch)."
+            [ -z "$merged" ] || echo "- Dropped (merged upstream): ${merged// /, }."
+            echo
+          } > ../entry.md
           awk -v f=../entry.md 'NR==1{print; print ""; while((getline l < f)>0) print l; next} {print}' CHANGELOG.md > ../cl.md && mv ../cl.md CHANGELOG.md
           git add -A BASE CHANGELOG.md patches
           git commit -qm "Upstream $TAG: BASE bump${merged:+, drop merged patches}"
-          git push origin HEAD:main
-          if [ -n "$merged" ]; then
-            gh label create upstream-merged --color 0E8A16 --description "A fix of ours is now in CoMaps" 2>/dev/null || true
-            gh issue create --title "Upstream $TAG merged: $(echo $merged | sed 's/ /, /g')" --label upstream-merged \
-              --body "CoMaps \`$TAG\` already contains these patches, so they were removed from \`patches/\`: $merged"
-          fi
-          echo "build=true" >> "$GITHUB_OUTPUT"; echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          # Scratch branch, rewritten by each retry; main is only fast-forwarded by the promote job.
+          git push -f origin "HEAD:refs/heads/watch/$TAG"
+          { echo "build=true"; echo "sha=$(git rev-parse HEAD)"; echo "merged=$merged"; } >> "$GITHUB_OUTPUT"
+
+      - name: Keep the schedule alive
+        # GitHub disables scheduled workflows after 60 days without repo activity; re-enable on every run.
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api -X PUT "repos/${{ github.repository }}/actions/workflows/upstream-watch.yml/enable" && echo "schedule re-enabled $(date -u +%F)" | tee -a "$GITHUB_STEP_SUMMARY" || echo "::warning::could not re-enable the schedule"
 
   build:
     needs: watch
@@ -142,3 +148,49 @@ jobs:
     secrets: inherit
     permissions:
       contents: write
+
+  promote:
+    needs: [watch, build]
+    if: needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.watch.outputs.tag }}
+      SHA: ${{ needs.watch.outputs.sha }}
+      MERGED: ${{ needs.watch.outputs.merged }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.watch.outputs.sha }}
+      - name: Fast-forward main to the built commit
+        run: |
+          git fetch -q origin main
+          if ! git merge-base --is-ancestor origin/main "$SHA"; then
+            echo "::error::main moved during the build; merge watch/$TAG into main by hand"; exit 1
+          fi
+          git push origin "$SHA:refs/heads/main"
+          git push origin --delete "watch/$TAG" || true
+          if [ -n "$MERGED" ]; then
+            gh label create upstream-merged --color 0E8A16 --description "A fix of ours is now in CoMaps" 2>/dev/null || true
+            gh issue create --title "Upstream $TAG merged: ${MERGED// /, }" --label upstream-merged \
+              --body "CoMaps \`$TAG\` already contains these patches, so they were removed from \`patches/\`: $MERGED"
+          fi
+
+  build-failed:
+    needs: [watch, build, promote]
+    if: always() && needs.watch.outputs.build == 'true' && (needs.build.result != 'success' || needs.promote.result != 'success')
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.watch.outputs.tag }}
+    steps:
+      - name: Open build-failed issue
+        run: |
+          title="Build failed on upstream $TAG"
+          gh label create build-failed --repo "${{ github.repository }}" --color D93F0B --description "Upstream watch could not build or promote a new release" 2>/dev/null || true
+          if [ -n "$(gh issue list --repo "${{ github.repository }}" --state open --label build-failed --search "\"$title\" in:title" --json number -q '.[].number')" ]; then
+            echo "Issue already open: $title"; exit 0
+          fi
+          gh issue create --repo "${{ github.repository }}" --title "$title" --label build-failed --body \
+            "Patches applied on CoMaps \`$TAG\`, but build=${{ needs.build.result }}, promote=${{ needs.promote.result }}. BASE on main is unchanged, so tomorrow's run tries again. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} (branch watch/$TAG)."

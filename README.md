@@ -11,7 +11,7 @@ This repo is a **patch queue**, not a copy of the CoMaps source:
 - `scripts/latest-tag.sh` — newest CoMaps Android release tag (`vYYYY.MM.DD-N`).
 - `scripts/check-apk.sh` — refuses an APK with the wrong signer, id or name, or with Google Play services / Firebase classes.
 - `.github/workflows/release.yml` — builds the fdroid flavour (no Google services), arm64, signs it with the OurMaps key and publishes a Release `<BASE>-own<N>`.
-- `.github/workflows/upstream-watch.yml` — daily 05:17 UTC: on a newer CoMaps release, re-applies the patches on a `watch/<tag>` branch and builds from it; `main` (BASE) moves only after a green build. Merged patches are dropped; a conflict opens a `rebase-conflict` issue, a failed build a `build-failed` issue (BASE unchanged, so the next day retries). Each run re-enables its own schedule, so GitHub's 60-day idle switch-off does not stop it.
+- `.github/workflows/upstream-watch.yml` — daily 05:17 UTC: on a newer CoMaps release, re-applies the patches on a `watch/<tag>` branch and builds from it; `main` (BASE) moves only after a green build. Merged patches are dropped; a conflict opens a `rebase-conflict` issue, a failed build a `build-failed` issue (BASE unchanged, so the next day retries). After 45 days with no commit on main it pushes a `KEEPALIVE` date file, so GitHub's 60-day idle switch-off never triggers (GitHub also emails the owner before disabling; re-enable under Actions if it ever happens).
 
 Tests: `tests/test-scripts.sh`, `tests/test-check-apk.sh`.
 

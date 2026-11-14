@@ -129,6 +129,20 @@ jobs:
           git push -f origin "HEAD:refs/heads/watch/$TAG"
           { echo "build=true"; echo "sha=$(git rev-parse HEAD)"; echo "merged=$merged"; } >> "$GITHUB_OUTPUT"
 
+      - name: Keepalive commit after 45 quiet days
+        # GitHub disables scheduled workflows after 60 days without repo activity (ada #11541).
+        if: always() && github.event_name == 'schedule'
+        working-directory: fork
+        run: |
+          git fetch -q origin main
+          last=$(git log -1 --format=%ct origin/main); now=$(date +%s)
+          if [ $(( (now - last) / 86400 )) -ge 45 ]; then
+            git config user.name "ourmaps-ci"; git config user.email "ourmaps-ci@users.noreply.github.com"
+            git checkout -q origin/main && date -u +%F > KEEPALIVE && git add KEEPALIVE
+            git commit -qm "keepalive: upstream watch still running" && git push origin HEAD:main
+            echo "keepalive commit pushed" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: Keep the schedule alive
         # GitHub disables scheduled workflows after 60 days without repo activity; re-enable on every run.
         if: always()
